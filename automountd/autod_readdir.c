@@ -416,6 +416,8 @@ create_dirents(struct dir_entry *list, off_t offset, uint32_t rda_count,
 		namelen = (int)strlen(l->name);
 		this_reclen = DIRENT_RECLEN(namelen);
 		if (outcount + this_reclen > total_bytes_wanted) {
+			*rddir_eof = FALSE;
+			*rddir_offset = l->offset;
 			break;
 		}
 
@@ -434,23 +436,19 @@ create_dirents(struct dir_entry *list, off_t offset, uint32_t rda_count,
 		outcount += dp->d_reclen;
 		dp = (struct dirent_nonext *)((char *)dp + dp->d_reclen);
 		assert(outcount <= total_bytes_wanted);
-		if (!l->next)
+		if (!l->next) {
+			*rddir_eof = TRUE;
+			*rddir_offset = l->offset + 1;
 			break;
+		}
 		l = l->next;
 	}
-
-	/*
-	 * "l" is the last element; make offset one plus that entry's
-	 * offset.
-	 */
-	*rddir_offset = l->offset + 1;
 
 	if (outcount > 0) {
 		/*
 		 * have some entries
 		 */
 		*rddir_entriesCnt = outcount;
-		*rddir_eof = (l->next == NULL);
 		*rddir_entries = outbuf;
 		error = 0;
 	} else {
@@ -459,13 +457,13 @@ create_dirents(struct dir_entry *list, off_t offset, uint32_t rda_count,
 		 * directory entry
 		 */
 		*rddir_entriesCnt = 0;
-		*rddir_eof = FALSE;
 		*rddir_entries = NULL;
 		vm_deallocate(current_task(), buffer_vm_address, bufsize);
 		syslog(LOG_ERR,
 			"byte count in readdir too small for one directory entry");
 		error = EIO;
 	}
+
 	return (error);
 
 empty:	*rddir_entriesCnt = 0;
@@ -747,9 +745,9 @@ build_subdir_entry_list(struct dir_entry *list, ino_t start_inonum)
 	}
 }
 
-pthread_mutex_t cleanup_lock;
-pthread_cond_t cleanup_start_cv;
-pthread_cond_t cleanup_done_cv;
+pthread_mutex_t cleanup_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cleanup_start_cv = PTHREAD_COND_INITIALIZER;
+pthread_cond_t cleanup_done_cv = PTHREAD_COND_INITIALIZER;
 
 /*
  * cache cleanup thread starting point
@@ -762,9 +760,6 @@ cache_cleanup(__unused void *unused)
 	int error;
 
 	pthread_setname_np("cache cleanup");
-	pthread_mutex_init(&cleanup_lock, NULL);
-	pthread_cond_init(&cleanup_start_cv, NULL);
-	pthread_cond_init(&cleanup_done_cv, NULL);
 
 	pthread_mutex_lock(&cleanup_lock);
 	for (;;) {
