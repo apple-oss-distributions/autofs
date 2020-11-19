@@ -1221,7 +1221,7 @@ auto_inactive(struct vnop_inactive_args *ap)
 	AUTOFS_DPRINT((4, "auto_inactive: vp=%p\n", (void *)ap->a_vp));
 
 	if (vnode_recycle_on_inactive) {
-		AUTOFS_DPRINT((4, "auto_inactive: recycling vp=%p\n", (void *)ap->a_vp))
+        AUTOFS_DPRINT((4, "auto_inactive: recycling vp=%p\n", (void *)ap->a_vp));
 		vnode_recycle(ap->a_vp);
 	}
 

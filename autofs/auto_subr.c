@@ -464,6 +464,9 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 		    (uint32_t) dirp->fn_nodeid, offset, alloc_count, &error,
 		    return_offset, return_eof, return_buffer,
 		return_bufcount);
+
+		AUTOFS_DPRINT((5, "auto_readdir_aux: path=%s name=%.*s subdir=%s error=%d\n",
+					   fnip->fi_path, keylen, key, subdir, error));
 	}
 
 	auto_release_port(automount_port);
@@ -477,8 +480,6 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 	}
 
 done:
-	AUTOFS_DPRINT((5, "auto_readdir_aux: path=%s name=%.*s subdir=%s error=%d\n",
-	    fnip->fi_path, keylen, key, subdir, error));
 	return (error);
 }
 
@@ -1191,7 +1192,7 @@ auto_plant_subtriggers(mount_t mp, subtrigger_t *subtriggers, vfs_context_t ctx)
 	vnode_t dvp;
 	subtrigger_t *subtrigger;
 	struct mounta *m;
-	int error;
+	int error = -1;
 	struct vnode_trigger_param vnt;
 	struct vnode_trigger_info vti;
 	trigger_info_t *ti;

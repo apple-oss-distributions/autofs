@@ -576,17 +576,16 @@ top:
 	 * Are we a process that should not trigger mounts?  If so,
 	 * don't trigger, just succeed.
 	 */
-	if (ti->ti_check_notrigger_process != NULL) {
-		if ((*ti->ti_check_notrigger_process)(pid)) {
-			/*
-			 * Don't trigger anything, just return
-			 * success.
-			 */
-			result = vfs_resolver_result(ti->ti_seq,
-			    RESOLVER_NOCHANGE, 0);
-			lck_mtx_unlock(ti->ti_lock);
-			return (result);
-		}
+	if (!vfs_context_can_resolve_triggers(ctx) ||
+	    (ti->ti_check_notrigger_process != NULL &&
+	     (*ti->ti_check_notrigger_process)(pid))) {
+		/*
+		 * Don't trigger anything, just return
+		 * success.
+		 */
+		result = vfs_resolver_result(ti->ti_seq, RESOLVER_NOCHANGE, 0);
+		lck_mtx_unlock(ti->ti_lock);
+		return (result);
 	}
 
 	/*
