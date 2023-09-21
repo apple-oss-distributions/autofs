@@ -4,5 +4,7 @@
 <dict>
 	<key>com.apple.private.apfs.create-synthetic-symlink-folder</key>
 	<true/>
+	<key>com.apple.private.security.storage.network.heritable</key>
+	<true/>
 </dict>
 </plist>
