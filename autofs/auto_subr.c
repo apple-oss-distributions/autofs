@@ -75,42 +75,132 @@
 #include "autofs_kern.h"
 #include "autofs_protUser.h"
 
-#define	TYPICALPATH_MAX	64
+#define TYPICALPATH_MAX 64
 
 /*
  * List of subtriggers to be planted on a mount.
  */
 typedef struct subtrigger {
-	struct mounta mounta;	/* struct mounta from the action list entry for the subtrigger */
-	int inplace;		/* is this subtrigger currently in place? */
+	struct mounta mounta;   /* struct mounta from the action list entry for the subtrigger */
+	int inplace;            /* is this subtrigger currently in place? */
 	struct subtrigger *next;
 } subtrigger_t;
 
 static subtrigger_t *auto_make_subtriggers(action_list *);
 static void auto_free_subtriggers(subtrigger_t *);
 static void auto_trigger_callback(mount_t, vfs_trigger_callback_op_t,
-     void *, vfs_context_t);
+    void *, vfs_context_t);
 static void auto_plant_subtriggers(mount_t, subtrigger_t *, vfs_context_t);
 
 /*
  * Parameters passed to an autofs mount thread.
  */
 struct autofs_callargs {
-	struct trigger_callargs fnc_t;	/* common args */
+	struct trigger_callargs fnc_t;  /* common args */
 };
 
-#define fnc_vp			fnc_t.tc_vp
-#define fnc_this_fsid		fnc_t.tc_this_fsid
-#define fnc_ti			fnc_t.tc_ti
-#define fnc_origin		fnc_t.tc_origin
+#define fnc_vp                  fnc_t.tc_vp
+#define fnc_this_fsid           fnc_t.tc_this_fsid
+#define fnc_ti                  fnc_t.tc_ti
+#define fnc_origin              fnc_t.tc_origin
 
-#define fnc_uid			fnc_t.tc_uid
-#define fnc_asid		fnc_t.tc_asid
-#define fnc_mounted_fsid	fnc_t.tc_mounted_fsid
-#define fnc_retflags		fnc_t.tc_retflags
+#define fnc_uid                 fnc_t.tc_uid
+#define fnc_asid                fnc_t.tc_asid
+#define fnc_mounted_fsid        fnc_t.tc_mounted_fsid
+#define fnc_retflags            fnc_t.tc_retflags
 
 static int auto_mount_request(struct autofs_callargs *, char *, char *,
     char *, int, char *, char *, boolean_t, boolean_t, boolean_t *);
+
+/*
+ * caller must hold fnip->fi_busy_mtx
+ */
+int
+autofs_mount_is_busy(fninfo_t *fnip, int mount_busy_state)
+{
+	int is_busy = 0;
+	if (mount_busy_state == MOUNT_BUSY_EXCLUSIVE) {
+		is_busy = fnip->fi_busy_shared || fnip->fi_busy_exclusive;
+	} else {
+		/* MOUNT_BUSY_SHARED */
+		is_busy = fnip->fi_busy_exclusive;
+	}
+	return is_busy;
+}
+
+#define MAX_BUSY_RETRY  10
+
+int
+autofs_mount_set_busy(fninfo_t *fnip, int mount_busy_state)
+{
+	struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+	int error = 0;
+	int is_busy = 0;
+	int retry_cnt = 0;
+	int call_wakeup = 0;
+
+	lck_mtx_lock(fnip->fi_busy_mtx);
+
+	while ((is_busy = autofs_mount_is_busy(fnip, mount_busy_state))) {
+		error = msleep(fnip->fi_busy_mtx, fnip->fi_busy_mtx, PZERO - 1, "autofsbusywant", &ts);
+		if (error == EWOULDBLOCK) {
+			retry_cnt++;
+			if (retry_cnt > MAX_BUSY_RETRY) {
+				AUTOFS_DPRINT((4, "autofs_mount_set_busy timed out waiting for %s busy. fi_busy_exclusive: %d, fi_busy_shared: %d",
+				    (mount_busy_state == MOUNT_BUSY_EXCLUSIVE) ? "exclusive": "shared",
+				    fnip->fi_busy_exclusive, fnip->fi_busy_shared));
+				error = EBUSY;
+				goto fail;
+			}
+			error = 0;
+		}
+	}
+	/*
+	 * Managed to hold the lock while mount is not busy
+	 */
+	if (mount_busy_state == MOUNT_BUSY_EXCLUSIVE) {
+		fnip->fi_busy_exclusive = 1;
+	} else {
+		/* MOUNT_BUSY_SHARED */
+		fnip->fi_busy_shared++;
+		/*
+		 * allow other shared threads to wakeup
+		 */
+		call_wakeup = 1;
+	}
+fail:
+	lck_mtx_unlock(fnip->fi_busy_mtx);
+	if (call_wakeup) {
+		wakeup(fnip->fi_busy_mtx);
+	}
+	return error;
+}
+
+void
+autofs_mount_clear_busy(fninfo_t *fnip, int mount_busy_state)
+{
+	int need_wakeup = 0;;
+	lck_mtx_lock(fnip->fi_busy_mtx);
+	if (mount_busy_state == MOUNT_BUSY_EXCLUSIVE) {
+		if (fnip->fi_busy_exclusive != 1) {
+			panic("invalid exclusive busy state, clearing busy with value %d", fnip->fi_busy_exclusive);
+		}
+		fnip->fi_busy_exclusive = 0;
+		need_wakeup = 1;
+	} else { /* MOUNT_BUSY_SHARED */
+		if (fnip->fi_busy_shared <= 0) {
+			panic("invalid shared busy state, clearing busy with value %d", fnip->fi_busy_shared);
+		}
+		fnip->fi_busy_shared--;
+		if (fnip->fi_busy_shared == 0) {
+			need_wakeup = 1;
+		}
+	}
+	lck_mtx_unlock(fnip->fi_busy_mtx);
+	if (need_wakeup) {
+		wakeup(fnip->fi_busy_mtx);
+	}
+}
 
 /*
  * Unless we're an automounter (in which case, the process that caused
@@ -121,14 +211,27 @@ static int auto_mount_request(struct autofs_callargs *, char *, char *,
  * to be asked to mount the file system from releasing the reader lock,
  * so everybody's deadlocked), get a reader lock on the fninfo_t.
  */
-boolean_t
-auto_fninfo_lock_shared(fninfo_t *fnip, int pid)
+int
+auto_fninfo_lock_shared(fninfo_t *fnip, int pid, int set_busy, int *lock_mode)
 {
+	int error = 0;
+	if (lock_mode == NULL) {
+		return EINVAL;
+	}
+	*lock_mode = 0;
 	if (!auto_is_automounter(pid)) {
+		if (set_busy) {
+			error = autofs_mount_set_busy(fnip, MOUNT_BUSY_SHARED);
+			if (error) {
+				goto out;
+			}
+			*lock_mode |= MOUNT_LOCK_MODE_BUSY;
+		}
 		lck_rw_lock_shared(fnip->fi_rwlock);
-                return 1;
-        }
-        return 0;
+		*lock_mode |= MOUNT_LOCK_MODE_LOCK;
+	}
+out:
+	return error;
 }
 
 /*
@@ -136,10 +239,14 @@ auto_fninfo_lock_shared(fninfo_t *fnip, int pid)
  * we don't have one.
  */
 void
-auto_fninfo_unlock_shared(fninfo_t *fnip, boolean_t have_lock)
+auto_fninfo_unlock_shared(fninfo_t *fnip, int lock_mode)
 {
-	if (have_lock)
+	if (lock_mode & MOUNT_LOCK_MODE_LOCK) {
 		lck_rw_unlock_shared(fnip->fi_rwlock);
+		if (lock_mode & MOUNT_LOCK_MODE_BUSY) {
+			autofs_mount_clear_busy(fnip, MOUNT_BUSY_SHARED);
+		}
+	}
 }
 
 /*
@@ -154,11 +261,13 @@ auto_is_autofs(mount_t mp)
 
 	vfsstat = vfs_statfs(mp);
 	typename_len = strlen(vfsstat->f_fstypename) + 1;
-	if (typename_len != sizeof autofs_typename)
-		return (0);	/* no, the strings aren't even the same length */
-	if (bcmp(autofs_typename, vfsstat->f_fstypename, typename_len) != 0)
-		return (0);	/* same length, different contents */
-	return (1);	/* same length, same contents */
+	if (typename_len != sizeof autofs_typename) {
+		return 0;     /* no, the strings aren't even the same length */
+	}
+	if (bcmp(autofs_typename, vfsstat->f_fstypename, typename_len) != 0) {
+		return 0;     /* same length, different contents */
+	}
+	return 1;     /* same length, same contents */
 }
 
 /*
@@ -222,11 +331,12 @@ auto_rearm(vnode_t vp, int pid)
 		lck_mtx_lock(fnp->fn_lock);
 		fnp->fn_uid = 0;
 		lck_mtx_unlock(fnp->fn_lock);
-	} else if (error == EBUSY)
+	} else if (error == EBUSY) {
 		IOLog("auto_rearm: process %d has already unmounted an automounted file system\n",
 		    pid);
-	else if (error == ENOENT)
+	} else if (error == ENOENT) {
 		IOLog("auto_rearm: can't get a reference on vnode %p\n", vp);
+	}
 }
 
 int
@@ -247,8 +357,9 @@ auto_lookup_request(fninfo_t *fnip, char *name, int namelen, char *subdir,
 	    namelen, name, subdir));
 
 	error = auto_get_automountd_port(&automount_port);
-	if (error)
+	if (error) {
 		return error;
+	}
 	ret = autofs_lookup(automount_port, fnip->fi_map, fnip->fi_path,
 	    name, namelen, subdir, fnip->fi_opts, isdirect,
 	    kauth_cred_getuid(vfs_context_ucred(context)), &error, node_type,
@@ -256,10 +367,10 @@ auto_lookup_request(fninfo_t *fnip, char *name, int namelen, char *subdir,
 	auto_release_port(automount_port);
 	if (ret != KERN_SUCCESS) {
 		if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-			error = EINTR;	// interrupted by a signal
+			error = EINTR;  // interrupted by a signal
 		} else {
 			IOLog("autofs: autofs_lookup failed, status 0x%08x\n", ret);
-			error = EIO;		/* XXX - process Mach errors */
+			error = EIO;            /* XXX - process Mach errors */
 		}
 	}
 	AUTOFS_DPRINT((5, "auto_lookup_request: path=%s name=%.*s error=%d\n",
@@ -289,7 +400,7 @@ get_key_and_subdirectory(struct fninfo *fnip, char *name, int namelen,
 		 * Build the subdirectory for this fnnode.
 		 */
 		subdir = &pathbuf[pathbuflen];
-		*--subdir = '\0';	/* trailing NUL */
+		*--subdir = '\0';       /* trailing NUL */
 
 		if (!(fnip->fi_flags & MF_DIRECT)) {
 			/*
@@ -313,37 +424,43 @@ get_key_and_subdirectory(struct fninfo *fnip, char *name, int namelen,
 			 * Don't walk up to the Root Of All Evil^W
 			 * top-level autofs mounts.
 			 */
-			if (parentp == fngp->fng_rootfnnodep)
+			if (parentp == fngp->fng_rootfnnodep) {
 				break;
+			}
 
 			/*
 			 * Don't walk up to any directory where
 			 * we should stop.
 			 */
-			if (parentp == stopfnp)
+			if (parentp == stopfnp) {
 				break;
+			}
 
 			/*
 			 * Add this component to the path.
 			 */
 			subdir -= namelen;
-			if (subdir < pathbuf)
-				return (ENAMETOOLONG);
+			if (subdir < pathbuf) {
+				return ENAMETOOLONG;
+			}
 			memcpy(subdir, name, namelen);
 
 			subdir--;
-			if (subdir < pathbuf)
-				return (ENAMETOOLONG);
+			if (subdir < pathbuf) {
+				return ENAMETOOLONG;
+			}
 			*subdir = '/';
 
 			name = parentp->fn_name;
 			namelen = parentp->fn_namelen;
-			if (parentp->fn_parent == parentp)
+			if (parentp->fn_parent == parentp) {
 				break;
+			}
 			parentp = parentp->fn_parent;
 		}
-	} else
+	} else {
 		subdir = fnip->fi_subdir;
+	}
 
 	/*
 	 * For direct maps, the key for an entry is the mount point
@@ -359,7 +476,7 @@ get_key_and_subdirectory(struct fninfo *fnip, char *name, int namelen,
 		*keylenp = namelen;
 	}
 	*subdirp = subdir;
-	return (0);
+	return 0;
 }
 
 int
@@ -379,8 +496,9 @@ auto_lookup_aux(struct fninfo *fnip, fnnode_t *parentp, char *name, int namelen,
 	 * don't wait for us to finish what we're doing, and
 	 * don't ask ourselves to do anything - just say we succeeded.
 	 */
-	if (auto_is_automounter(vfs_context_pid(context)))
-		return (0);
+	if (auto_is_automounter(vfs_context_pid(context))) {
+		return 0;
+	}
 
 	/*
 	 * Find the appropriate key and subdirectory to pass to
@@ -388,8 +506,9 @@ auto_lookup_aux(struct fninfo *fnip, fnnode_t *parentp, char *name, int namelen,
 	 */
 	error = get_key_and_subdirectory(fnip, name, namelen, parentp,
 	    &key, &keylen, &subdir, pathbuf, sizeof(pathbuf));
-	if (error != 0)
-		return (error);
+	if (error != 0) {
+		return error;
+	}
 
 	error = auto_lookup_request(fnip, key, keylen, subdir, context,
 	    node_type, &lu_verbose);
@@ -398,7 +517,7 @@ auto_lookup_aux(struct fninfo *fnip, fnnode_t *parentp, char *name, int namelen,
 		fngp->fng_verbose = lu_verbose;
 	}
 
-	return (error);
+	return error;
 }
 
 int
@@ -418,8 +537,9 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 	isdirect = fnip->fi_flags & MF_DIRECT ? TRUE : FALSE;
 
 	error = auto_get_automountd_port(&automount_port);
-	if (error)
+	if (error) {
 		goto done;
+	}
 
 	if (dirp == vntofn(fnip->fi_rootvp) && !isdirect) {
 		/*
@@ -436,7 +556,7 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 		ret = autofs_readdir(automount_port, fnip->fi_map,
 		    offset, alloc_count, &error,
 		    return_offset, return_eof, return_buffer,
-		return_bufcount);
+		    return_bufcount);
 	} else {
 		/*
 		 * This is a directory under a top-level directory of
@@ -463,16 +583,16 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 		    key, keylen, subdir, fnip->fi_opts,
 		    (uint32_t) dirp->fn_nodeid, offset, alloc_count, &error,
 		    return_offset, return_eof, return_buffer,
-		return_bufcount);
+		    return_bufcount);
 
 		AUTOFS_DPRINT((5, "auto_readdir_aux: path=%s name=%.*s subdir=%s error=%d\n",
-					   fnip->fi_path, keylen, key, subdir, error));
+		    fnip->fi_path, keylen, key, subdir, error));
 	}
 
 	auto_release_port(automount_port);
 	if (ret != KERN_SUCCESS) {
 		if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-			error = EINTR;	// interrupted by a signal
+			error = EINTR;  // interrupted by a signal
 		} else {
 			IOLog("autofs: autofs_readdir failed, status 0x%08x\n", ret);
 			error = EIO;
@@ -480,7 +600,7 @@ auto_readdir_aux(struct fninfo *fnip, fnnode_t *dirp, off_t offset,
 	}
 
 done:
-	return (error);
+	return error;
 }
 
 static int
@@ -488,7 +608,7 @@ auto_check_homedirmount(vnode_t vp)
 {
 	fnnode_t *fnp = vntofn(vp);
 
-	return (fnp->fn_flags & MF_HOMEDIRMOUNT);
+	return fnp->fn_flags & MF_HOMEDIRMOUNT;
 }
 
 /*
@@ -511,7 +631,7 @@ autofs_trigger_get_mount_args(__unused vnode_t vp, vfs_context_t ctx, int *errp)
 	argsp->fnc_uid = kauth_cred_getuid(vfs_context_ucred(ctx));
 
 	*errp = 0;
-	return (argsp);
+	return argsp;
 }
 
 /*
@@ -532,7 +652,7 @@ auto_do_mount(void *arg)
 	char pathbuf[MAXPATHLEN];
 	char *subdir;
 	struct autofs_globals *fngp;
-        boolean_t have_lock = 0;
+	int lock_mode = 0;
 
 	vp = argsp->fnc_vp;
 	fnp = vntofn(vp);
@@ -541,7 +661,10 @@ auto_do_mount(void *arg)
 	/*
 	 * This is in a kernel thread, so the PID is 0.
 	 */
-	have_lock = auto_fninfo_lock_shared(fnip, 0);
+	error = auto_fninfo_lock_shared(fnip, 0, 1, &lock_mode);
+	if (error) {
+		return error;
+	}
 
 	/*
 	 * Is this in the process of being unmounted?  If so, give
@@ -549,8 +672,8 @@ auto_do_mount(void *arg)
 	 * the vnode, and the unmount can finish.
 	 */
 	if (fnip->fi_flags & MF_UNMOUNTING) {
-		auto_fninfo_unlock_shared(fnip, have_lock);
-		return (ENOENT);
+		auto_fninfo_unlock_shared(fnip, lock_mode);
+		return ENOENT;
 	}
 
 	/*
@@ -561,11 +684,11 @@ auto_do_mount(void *arg)
 	    fnp->fn_namelen, fnp->fn_parent, &key, &keylen,
 	    &subdir, pathbuf, sizeof(pathbuf));
 	if (error != 0) {
-		auto_fninfo_unlock_shared(fnip, have_lock);
-		return (error);
+		auto_fninfo_unlock_shared(fnip, lock_mode);
+		return error;
 	}
 
-        /* <13595777> Keep from racing with homedirmounter */
+	/* <13595777> Keep from racing with homedirmounter */
 	lck_mtx_lock(fnp->fn_mnt_lock);
 
 	/*
@@ -602,13 +725,13 @@ auto_do_mount(void *arg)
 		fnp->fn_uid = 0;
 		lck_mtx_unlock(fnp->fn_lock);
 	}
-        
-        /* <13595777> Keep from racing with homedirmounter */
-	lck_mtx_unlock(fnp->fn_mnt_lock);
-        
-	auto_fninfo_unlock_shared(fnip, have_lock);
 
-	return (error);
+	/* <13595777> Keep from racing with homedirmounter */
+	lck_mtx_unlock(fnp->fn_mnt_lock);
+
+	auto_fninfo_unlock_shared(fnip, lock_mode);
+
+	return error;
 }
 
 static void
@@ -637,9 +760,9 @@ auto_do_submount(void *arg)
 	boolean_t mr_verbose;
 
 	key = m->key;
-	if (key != NULL)
+	if (key != NULL) {
 		keylen = (int)strlen(key);
-	else {
+	} else {
 		/*
 		 * automountd handed us a null string; presumably
 		 * that means the key is irrelevant, so use a
@@ -651,7 +774,7 @@ auto_do_submount(void *arg)
 	error = auto_mount_request(argsp, m->map, m->path, key, keylen,
 	    m->subdir, m->opts, TRUE, TRUE, &mr_verbose);
 
-	return (error);
+	return error;
 }
 
 /*
@@ -679,22 +802,23 @@ auto_mount_subtrigger_request(
 	boolean_t top_level;
 
 	error = auto_get_automountd_port(&automount_port);
-	if (error)
-		return (error);
+	if (error) {
+		return error;
+	}
 	ret = autofs_mount_subtrigger(automount_port, mntpt, submntpt, path,
 	    opts, map, subdir, key, flags, mntflags, direct, fsidp,
 	    &top_level, &error);
 	auto_release_port(automount_port);
 	if (ret != KERN_SUCCESS) {
 		if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-			error = EINTR;	// interrupted by a signal
+			error = EINTR;  // interrupted by a signal
 		} else {
 			IOLog("autofs: autofs_mount_subtrigger failed, status 0x%08x\n",
-			  ret);
-			error = EIO;		/* XXX - process Mach errors */
+			    ret);
+			error = EIO;            /* XXX - process Mach errors */
 		}
 	}
-	return (error);
+	return error;
 }
 
 /*
@@ -708,7 +832,7 @@ autofs_subtrigger_get_mount_args(__unused vnode_t vp, __unused vfs_context_t ctx
 	argsp = kalloc_type(struct trigger_callargs, Z_WAITOK);
 	*errp = 0;
 
-	return (argsp);
+	return argsp;
 }
 
 /*
@@ -738,9 +862,9 @@ auto_do_subtrigger_mount(void *arg)
 	error = auto_mount_subtrigger_request(m->path, mntpnt, m->path,
 	    m->opts, m->map, m->subdir, m->key, m->flags, m->mntflags,
 	    m->isdirect, &tc->tc_mounted_fsid);
-	tc->tc_retflags = FALSE;	/* we mounted an autofs file system; it's not volfs or NFS, hard or otherwise */
+	tc->tc_retflags = FALSE;        /* we mounted an autofs file system; it's not volfs or NFS, hard or otherwise */
 
-	return (error);
+	return error;
 }
 
 static void
@@ -770,58 +894,58 @@ getstring(char **strp, uint8_t **inbufp, mach_msg_type_number_t *bytes_leftp)
 {
 	uint32_t stringlen;
 
-	if (*bytes_leftp < sizeof (uint32_t)) {
+	if (*bytes_leftp < sizeof(uint32_t)) {
 		IOLog("Action list too short for string length");
-		return (EIO);
+		return EIO;
 	}
-	memcpy(&stringlen, *inbufp, sizeof (uint32_t));
-	*inbufp += sizeof (uint32_t);
-	*bytes_leftp -= (mach_msg_type_number_t)sizeof (uint32_t);
+	memcpy(&stringlen, *inbufp, sizeof(uint32_t));
+	*inbufp += sizeof(uint32_t);
+	*bytes_leftp -= (mach_msg_type_number_t)sizeof(uint32_t);
 	if (stringlen == 0xFFFFFFFF) {
 		/* Null pointer */
 		*strp = NULL;
 	} else {
 		if (*bytes_leftp < stringlen) {
 			IOLog("Action list too short for string data");
-			return (EIO);
+			return EIO;
 		}
 		*strp = kalloc_data(stringlen + 1, Z_WAITOK);
 		if (*strp == NULL) {
 			IOLog("No space for string data in action list");
-			return (ENOMEM);
+			return ENOMEM;
 		}
 		memcpy(*strp, *inbufp, stringlen);
 		(*strp)[stringlen] = '\0';
 		*inbufp += stringlen;
 		*bytes_leftp -= stringlen;
 	}
-	return (0);
+	return 0;
 }
 
 static int
 getint(int *intp, uint8_t **inbufp, mach_msg_type_number_t *bytes_leftp)
 {
-	if (*bytes_leftp < sizeof (int)) {
+	if (*bytes_leftp < sizeof(int)) {
 		IOLog("Action list too short for int");
-		return (EIO);
+		return EIO;
 	}
-	memcpy(intp, *inbufp, sizeof (int));
-	*inbufp += sizeof (int);
-	*bytes_leftp -= (mach_msg_type_number_t)sizeof (int);
-	return (0);
+	memcpy(intp, *inbufp, sizeof(int));
+	*inbufp += sizeof(int);
+	*bytes_leftp -= (mach_msg_type_number_t)sizeof(int);
+	return 0;
 }
 
 static int
 getuint32(uint32_t *uintp, uint8_t **inbufp, mach_msg_type_number_t *bytes_leftp)
 {
-	if (*bytes_leftp < sizeof (uint32_t)) {
+	if (*bytes_leftp < sizeof(uint32_t)) {
 		IOLog("Action list too short for uint32_t");
-		return (EIO);
+		return EIO;
 	}
-	memcpy(uintp, *inbufp, sizeof (uint32_t));
-	*inbufp += sizeof (uint32_t);
-	*bytes_leftp -= (mach_msg_type_number_t)sizeof (uint32_t);
-	return (0);
+	memcpy(uintp, *inbufp, sizeof(uint32_t));
+	*inbufp += sizeof(uint32_t);
+	*bytes_leftp -= (mach_msg_type_number_t)sizeof(uint32_t);
+	return 0;
 }
 
 /*
@@ -830,20 +954,27 @@ getuint32(uint32_t *uintp, uint8_t **inbufp, mach_msg_type_number_t *bytes_leftp
 static void
 free_mounta_strings(struct mounta *m)
 {
-	if (m->dir != NULL)
+	if (m->dir != NULL) {
 		kfree_data(m->dir, strlen(m->dir) + 1);
-	if (m->opts != NULL)
+	}
+	if (m->opts != NULL) {
 		kfree_data(m->opts, strlen(m->opts) + 1);
-	if (m->path != NULL)
+	}
+	if (m->path != NULL) {
 		kfree_data(m->path, strlen(m->path) + 1);
-	if (m->map != NULL)
+	}
+	if (m->map != NULL) {
 		kfree_data(m->map, strlen(m->map) + 1);
-	if (m->subdir != NULL)
+	}
+	if (m->subdir != NULL) {
 		kfree_data(m->subdir, strlen(m->subdir) + 1);
-	if (m->trig_mntpnt != NULL)
+	}
+	if (m->trig_mntpnt != NULL) {
 		kfree_data(m->trig_mntpnt, strlen(m->trig_mntpnt) + 1);
-	if (m->key != NULL)
+	}
+	if (m->key != NULL) {
 		kfree_data(m->key, strlen(m->key) + 1);
+	}
 }
 
 static void
@@ -910,7 +1041,7 @@ auto_mount_request(
 			    (vm_map_copy_t)actions_buffer);
 			if (ret != KERN_SUCCESS) {
 				if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-					error = EINTR;	// interrupted by a signal
+					error = EINTR;  // interrupted by a signal
 				} else {
 					/* XXX - deal with Mach errors */
 					IOLog("autofs: vm_map_copyout failed, status 0x%08x\n", ret);
@@ -928,55 +1059,67 @@ auto_mount_request(
 			bytes_left = actions_bufcount;
 			while (bytes_left != 0) {
 				alp = kalloc_type(struct action_list, Z_WAITOK);
-				if (prevalp == NULL)
+				if (prevalp == NULL) {
 					alphead = alp;
-				else
+				} else {
 					prevalp->next = alp;
+				}
 				bzero(alp, sizeof *alp);
 				error = getstring(&alp->mounta.dir, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.opts, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.path, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.map, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.subdir, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.trig_mntpnt, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getint(&alp->mounta.flags, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getint(&alp->mounta.mntflags, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getuint32(&alp->mounta.isdirect, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getuint32(&alp->mounta.needs_subtrigger, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				error = getstring(&alp->mounta.key, &inbuf,
 				    &bytes_left);
-				if (error)
+				if (error) {
 					break;
+				}
 				prevalp = alp;
 			}
 			vm_deallocate(kernel_map, data, actions_bufcount);
@@ -1041,17 +1184,17 @@ auto_mount_request(
 		}
 	} else {
 		if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-			error = EINTR;	// interrupted by a signal
+			error = EINTR;  // interrupted by a signal
 		} else {
 			IOLog("autofs: autofs_mount failed, status 0x%08x\n", ret);
-			error = EIO;		/* XXX - process Mach errors */
+			error = EIO;            /* XXX - process Mach errors */
 		}
 	}
 
 done:
 	AUTOFS_DPRINT((5, "auto_mount_request: path=%s key=%.*s error=%d\n",
 	    path, keylen, key, error));
-	return (error);
+	return error;
 }
 
 #if 0
@@ -1082,28 +1225,29 @@ auto_send_unmount_request(
 	kern_return_t ret;
 
 	AUTOFS_DPRINT((4, "\tauto_send_unmount_request: fstype=%s "
-			" mntpnt=%s\n", fstype,	mntpnt));
+	    " mntpnt=%s\n", fstype, mntpnt));
 	error = auto_get_automountd_port(&automount_port);
-	if (error)
+	if (error) {
 		goto done;
+	}
 	ret = autofs_unmount(automount_port, fsid.val[0], fsid.val[1],
 	    mntresource, mntpnt, fstype, mntopts, &status);
 	auto_release_port(automount_port);
-	if (ret == KERN_SUCCESS)
+	if (ret == KERN_SUCCESS) {
 		error = status;
-	else {
+	} else {
 		if (ret == MACH_RCV_INTERRUPTED || ret == MACH_SEND_INTERRUPTED) {
-			error = EINTR;	// interrupted by a signal
+			error = EINTR;  // interrupted by a signal
 		} else {
 			IOLog("autofs: autofs_unmount failed, status 0x%08x\n", ret);
-			error = EIO;		/* XXX - process Mach errors */
+			error = EIO;            /* XXX - process Mach errors */
 		}
 	}
 
 done:
 	AUTOFS_DPRINT((5, "\tauto_send_unmount_request: error=%d\n", error));
 
-	return (error);
+	return error;
 }
 #endif
 
@@ -1122,9 +1266,9 @@ auto_make_subtriggers(action_list *alp)
 	for (p = alp; p != NULL; p = pnext) {
 		pnext = p->next;
 		subtrigger = kalloc_type(struct subtrigger, Z_WAITOK);
-		subtrigger->mounta = p->mounta;	/* copies pointers */
-		subtrigger->inplace = 0;	/* not planted yet */
-		subtrigger->next = NULL;	/* end of the list, so far */
+		subtrigger->mounta = p->mounta; /* copies pointers */
+		subtrigger->inplace = 0;        /* not planted yet */
+		subtrigger->next = NULL;        /* end of the list, so far */
 		if (prev_subtrigger == NULL) {
 			/* First subtrigger - set the list head */
 			subtriggers = subtrigger;
@@ -1136,7 +1280,7 @@ auto_make_subtriggers(action_list *alp)
 		kfree_type(struct action_list, p); /* XXXab: is this ok? */
 	}
 
-	return (subtriggers);
+	return subtriggers;
 }
 
 /*
@@ -1162,7 +1306,6 @@ auto_trigger_callback(mount_t mp, vfs_trigger_callback_op_t op, void *data,
 	subtrigger_t *subtriggers = data;
 
 	switch (op) {
-
 	case VTC_RELEASE:
 		/*
 		 * Release the subtrigger list.
@@ -1207,8 +1350,9 @@ auto_plant_subtriggers(mount_t mp, subtrigger_t *subtriggers, vfs_context_t ctx)
 		 * Is this subtrigger already (still) in place?  If so,
 		 * skip it.
 		 */
-		if (subtrigger->inplace)
+		if (subtrigger->inplace) {
 			continue;
+		}
 
 		m = &subtrigger->mounta;
 
@@ -1295,8 +1439,8 @@ auto_plant_subtriggers(mount_t mp, subtrigger_t *subtriggers, vfs_context_t ctx)
 		if (error != 0) {
 			trigger_free(ti);
 			IOLog(
-			    "autofs: vfs_addtrigger on %s/%s failed error=%d\n",
-			    vfs_statfs(mp)->f_mntonname, m->trig_mntpnt, error);
+				"autofs: vfs_addtrigger on %s/%s failed error=%d\n",
+				vfs_statfs(mp)->f_mntonname, m->trig_mntpnt, error);
 			continue;
 		}
 
@@ -1344,8 +1488,9 @@ auto_makefnnode(
 	if (cnp != NULL) {
 		name = cnp->cn_nameptr;
 		namelen = cnp->cn_namelen;
-	} else
+	} else {
 		namelen = (int)strlen(name);
+	}
 
 	fnp = kalloc_type(struct fnnode, Z_WAITOK | Z_ZERO);
 	fnp->fn_namelen = namelen;
@@ -1403,8 +1548,9 @@ auto_makefnnode(
 		    autofs_trigger_rel_mount_args,
 		    auto_rearm,
 		    NULL, NULL);
-		if (node_type & NT_FORCEMOUNT)
+		if (node_type & NT_FORCEMOUNT) {
 			fnp->fn_trigger_info->ti_flags |= TF_FORCEMOUNT;
+		}
 		error = vnode_create(VNCREATE_TRIGGER, VNCREATE_TRIGGER_SIZE,
 		    &vnt, &vp);
 	} else {
@@ -1413,10 +1559,11 @@ auto_makefnnode(
 	}
 	if (error != 0) {
 		AUTOFS_DPRINT((5, "auto_makefnnode failed with vnode_create error code %d\n", error));
-		if (fnp->fn_trigger_info != NULL)
+		if (fnp->fn_trigger_info != NULL) {
 			trigger_free(fnp->fn_trigger_info);
-		FREE(fnp->fn_name, M_TEMP);
-		FREE(fnp, M_TEMP);
+		}
+		kfree_data(fnp->fn_name, fnp->fn_namelen + 1);
+		kfree_type(struct fnnode, fnp);
 		return error;
 	}
 
@@ -1472,8 +1619,9 @@ auto_makefnnode(
 	 * However, we can't call vnode_setneedinactive(), as it's not
 	 * exported from the kernel.
 	 */
-	if (vnode_ref(vp) == 0)
+	if (vnode_ref(vp) == 0) {
 		vnode_rele(vp);
+	}
 
 #ifdef DEBUG
 	/*
@@ -1492,7 +1640,7 @@ auto_makefnnode(
 #endif
 	*fnpp = fnp;
 
-	return (0);
+	return 0;
 }
 
 
@@ -1568,11 +1716,11 @@ auto_disconnect(
 		tmp = *fnpp;
 		if (tmp == NULL) {
 			panic(
-			    "auto_disconnect: %p not in %p dirent list",
-			    (void *)fnp, (void *)dfnp);
+				"auto_disconnect: %p not in %p dirent list",
+				(void *)fnp, (void *)dfnp);
 		}
 		if (tmp == fnp) {
-			*fnpp = tmp->fn_next;	/* remove it from the list */
+			*fnpp = tmp->fn_next;   /* remove it from the list */
 			if (isdir) {
 				/*
 				 * Vnode being disconnected was a directory,
@@ -1711,7 +1859,7 @@ auto_enter(fnnode_t *dfnp, struct componentname *cnp, fnnode_t **fnpp)
 				 */
 				error = EJUSTRETURN;
 			}
-			return (error);
+			return error;
 		}
 
 		if (cfnp->fn_next != NULL) {
@@ -1741,7 +1889,7 @@ auto_enter(fnnode_t *dfnp, struct componentname *cnp, fnnode_t **fnpp)
 		lck_rw_done(dfnp->fn_rwlock);
 		vnode_put(fntovn(*fnpp));
 		error = EJUSTRETURN;
-		return (error);
+		return error;
 	}
 
 	/*
@@ -1756,7 +1904,7 @@ auto_enter(fnnode_t *dfnp, struct componentname *cnp, fnnode_t **fnpp)
 	(*fnpp)->fn_parent = dfnp;
 	(*fnpp)->fn_parentvp = pvp;
 	(*fnpp)->fn_parentvid = vnode_vid(pvp);
-	(*fnpp)->fn_linkcnt++;	/* parent now holds reference to entry */
+	(*fnpp)->fn_linkcnt++;  /* parent now holds reference to entry */
 
 	/*
 	 * dfnp->fn_linkcnt and dfnp->fn_direntcnt protected by dfnp->rw_lock
@@ -1768,12 +1916,12 @@ auto_enter(fnnode_t *dfnp, struct componentname *cnp, fnnode_t **fnpp)
 		 */
 		dfnp->fn_linkcnt++;
 	}
-	dfnp->fn_direntcnt++;	/* count the directory entry for the new fnnode */
+	dfnp->fn_direntcnt++;   /* count the directory entry for the new fnnode */
 
 	lck_rw_done(dfnp->fn_rwlock);
 
 	AUTOFS_DPRINT((5, "*fnpp=%p\n", (void *)*fnpp));
-	return (0);
+	return 0;
 }
 
 fnnode_t *
@@ -1797,12 +1945,12 @@ auto_search(fnnode_t *dfnp, char *name, int namelen)
 		if (p->fn_namelen == namelen &&
 		    bcmp(p->fn_name, name, namelen) == 0) {
 			AUTOFS_DPRINT((5, "auto_search: success\n"));
-			return (p);
+			return p;
 		}
 	}
 
 	AUTOFS_DPRINT((5, "auto_search: failure\n"));
-	return (NULL);
+	return NULL;
 }
 
 #ifdef DEBUG
